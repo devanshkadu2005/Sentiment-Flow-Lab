@@ -1,50 +1,31 @@
 import { NextResponse } from "next/server";
-import Sentiment from "sentiment";
-
-const vader = require("vader-sentiment");
-const sentiment = new Sentiment();
 
 export const runtime = "nodejs";
-
-type SentimentLabel = "positive" | "negative";
 
 type ModelResult = {
   name: string;
   family: string;
-  label: SentimentLabel;
+  label: "positive" | "negative";
   posProb: number;
   confidence: number;
   notes: string;
   latencyMs: number;
+  testAccuracy?: number;
+  tunedThreshold: number;
 };
 
-const POSITIVE_TERMS = new Set([
-  "excellent",
-  "amazing",
-  "great",
-  "beautiful",
-  "love",
-  "best",
-  "enjoyed",
-  "wonderful",
-  "fantastic",
-  "moving",
-]);
-
-const NEGATIVE_TERMS = new Set([
-  "awful",
-  "terrible",
-  "worst",
-  "boring",
-  "hate",
-  "waste",
-  "poor",
-  "mess",
-  "disappointing",
-  "flat",
-]);
-
-const NEGATORS = new Set(["not", "never", "hardly", "barely", "no"]);
+type BackendModel = {
+  key: string;
+  name: string;
+  family: string;
+  pos_prob: number;
+  latency_ms: number;
+  test_accuracy?: number | null;
+  threshold?: number;
+  label?: "positive" | "negative";
+  confidence?: number;
+  note?: string;
+};
 
 function clamp01(value: number) {
   if (value < 0) return 0;
@@ -52,169 +33,40 @@ function clamp01(value: number) {
   return value;
 }
 
-function scoreToProbability(score: number, scale = 2.6) {
-  return 1 / (1 + Math.exp(-score / scale));
-}
-
-function buildResult(name: string, family: string, posProb: number, confidence: number, notes: string, latencyMs: number): ModelResult {
-  return {
-    name,
-    family,
-    label: posProb >= 0.5 ? "positive" : "negative",
-    posProb: clamp01(posProb),
-    confidence: clamp01(confidence),
-    notes,
-    latencyMs,
-  };
-}
-
-function lexiconClassic(text: string): Omit<ModelResult, "latencyMs"> {
-  const tokens = text.toLowerCase().match(/[a-z']+/g) ?? [];
-  let score = 0;
-  let matched = 0;
-
-  for (let i = 0; i < tokens.length; i += 1) {
-    const current = tokens[i];
-    const previous = i > 0 ? tokens[i - 1] : "";
-    const inverted = NEGATORS.has(previous);
-
-    if (POSITIVE_TERMS.has(current)) {
-      score += inverted ? -1 : 1;
-      matched += 1;
-    }
-    if (NEGATIVE_TERMS.has(current)) {
-      score += inverted ? 1 : -1;
-      matched += 1;
-    }
-  }
-
-  const posProb = scoreToProbability(score, 2.2);
-  const confidence = clamp01(Math.min(1, Math.abs(score) / Math.max(2, matched + 1)) + 0.1);
-
-  return {
-    name: "Lexicon Classic",
-    family: "Rule-based",
-    label: posProb >= 0.5 ? "positive" : "negative",
-    posProb,
-    confidence,
-    notes: matched > 0 ? `Matched ${matched} weighted sentiment terms.` : "No strong keywords; treated as mild sentiment.",
-  };
-}
-
-function sentimentJsModel(text: string): Omit<ModelResult, "latencyMs"> {
-  const result = sentiment.analyze(text);
-  const comparative = Number.isFinite(result.comparative) ? result.comparative : 0;
-  const posProb = scoreToProbability(comparative, 0.8);
-  const confidence = clamp01(Math.abs(comparative) / 1.8 + 0.15);
-
-  return {
-    name: "Sentiment.js",
-    family: "Bag-of-words",
-    label: posProb >= 0.5 ? "positive" : "negative",
-    posProb,
-    confidence,
-    notes: `Comparative score: ${comparative.toFixed(3)}.`,
-  };
-}
-
-function vaderModel(text: string): Omit<ModelResult, "latencyMs"> {
-  const scores = vader.SentimentIntensityAnalyzer.polarity_scores(text);
-  const compound = Number(scores.compound ?? 0);
-  const posProb = clamp01((compound + 1) / 2);
-  const confidence = clamp01(Math.abs(compound));
-
-  return {
-    name: "VADER",
-    family: "Social text",
-    label: posProb >= 0.5 ? "positive" : "negative",
-    posProb,
-    confidence,
-    notes: `Compound score: ${compound.toFixed(3)}.`,
-  };
-}
-
-function contextAwareModel(text: string): Omit<ModelResult, "latencyMs"> {
-  const lc = text.toLowerCase();
-  const base = sentiment.analyze(text).comparative || 0;
-  let score = base;
-  const notes: string[] = [];
-
-  if (/(yeah right|as if|sure because)/.test(lc)) {
-    score -= 1.2;
-    notes.push("Sarcasm cue found.");
-  }
-
-  const pivotParts = lc.split(/\b(?:but|however|although)\b/);
-  if (pivotParts.length > 1) {
-    const tail = pivotParts[pivotParts.length - 1] || "";
-    score = score * 0.45 + (sentiment.analyze(tail).comparative || 0) * 0.9;
-    notes.push("Weighted latter clause after contrast cue.");
-  }
-
-  const shoutCount = (text.match(/[A-Z]{2,}/g) ?? []).length;
-  if (shoutCount > 1) {
-    score += score >= 0 ? 0.2 : -0.2;
-    notes.push("All-caps intensity adjusted.");
-  }
-
-  const posProb = scoreToProbability(score, 0.9);
-  const confidence = clamp01(Math.abs(score) / 1.5 + 0.2);
-
-  return {
-    name: "Context Lens",
-    family: "Heuristic",
-    label: posProb >= 0.5 ? "positive" : "negative",
-    posProb,
-    confidence,
-    notes: notes.length ? notes.join(" ") : "No special context cues detected.",
-  };
-}
-
-async function transformerModel(text: string): Promise<Omit<ModelResult, "latencyMs"> | null> {
-  const token = process.env.HF_TOKEN;
-  if (!token) return null;
-
-  const response = await fetch(
-    "https://api-inference.huggingface.co/models/cardiffnlp/twitter-roberta-base-sentiment-latest",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        inputs: text,
-        options: { wait_for_model: true },
-      }),
-      cache: "no-store",
-    },
+function buildResult(model: BackendModel): ModelResult {
+  const posProb = clamp01(Number(model.pos_prob));
+  const tunedThreshold = clamp01(typeof model.threshold === "number" ? model.threshold : 0.5);
+  const confidence = clamp01(
+    typeof model.confidence === "number" ? model.confidence : Math.abs(posProb - tunedThreshold) * 2,
   );
-
-  if (!response.ok) return null;
-
-  const raw = await response.json();
-  const list = Array.isArray(raw) ? (Array.isArray(raw[0]) ? raw[0] : raw) : [];
-  if (!Array.isArray(list) || list.length === 0) return null;
-
-  let pos = 0.5;
-  let neg = 0.5;
-  for (const item of list) {
-    const label = String(item.label ?? "").toLowerCase();
-    const score = Number(item.score ?? 0);
-    if (label.includes("positive") || label === "label_2") pos = score;
-    if (label.includes("negative") || label === "label_0") neg = score;
-  }
-
-  const total = Math.max(pos + neg, 1e-6);
-  const posProb = clamp01(pos / total);
+  const acc = typeof model.test_accuracy === "number" ? clamp01(model.test_accuracy) : undefined;
 
   return {
-    name: "RoBERTa (HF)",
-    family: "Transformer",
-    label: posProb >= 0.5 ? "positive" : "negative",
+    name: model.name,
+    family: model.family,
+    label: model.label === "positive" || model.label === "negative" ? model.label : posProb >= tunedThreshold ? "positive" : "negative",
     posProb,
-    confidence: clamp01(Math.max(pos, neg)),
-    notes: "API-backed transformer analysis.",
+    confidence,
+    notes:
+      model.note || (acc !== undefined ? `Offline test accuracy ${(acc * 100).toFixed(1)}%.` : "Prediction from trained model."),
+    latencyMs: Math.max(0, Number(model.latency_ms) || 0),
+    testAccuracy: acc,
+    tunedThreshold,
+  };
+}
+
+function deriveConsensus(models: ModelResult[]) {
+  const posVotes = models.filter((item) => item.label === "positive").length;
+  const total = models.length;
+  const label = total === 4 && posVotes === 2 ? "indeterminate" : posVotes > total / 2 ? "positive" : "negative";
+  const confidence = models.reduce((sum, item) => sum + item.confidence, 0) / Math.max(total, 1);
+  return {
+    label,
+    posVotes,
+    total,
+    agreement: `${posVotes}/${total} models positive`,
+    confidence: clamp01(confidence),
+    reason: label === "indeterminate" ? "Exact split across models." : "Majority from model outputs.",
   };
 }
 
@@ -233,46 +85,80 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Text too long. Limit to 4000 characters." }, { status: 400 });
     }
 
-    const localModels = [lexiconClassic, sentimentJsModel, vaderModel, contextAwareModel];
-    const localResults: ModelResult[] = localModels.map((fn) => {
-      const start = Date.now();
-      const result = fn(text);
-      return buildResult(result.name, result.family, result.posProb, result.confidence, result.notes, Date.now() - start);
-    });
-
-    const tfStart = Date.now();
-    const transformer = await transformerModel(text);
-    if (transformer) {
-      localResults.push(
-        buildResult(
-          transformer.name,
-          transformer.family,
-          transformer.posProb,
-          transformer.confidence,
-          transformer.notes,
-          Date.now() - tfStart,
-        ),
+    const backendUrl = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000").replace(/\/$/, "");
+    let response: Response;
+    try {
+      response = await fetch(`${backendUrl}/predict`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ text }),
+        cache: "no-store",
+      });
+    } catch {
+      return NextResponse.json(
+        {
+          error: "ML backend is unreachable.",
+          detail: `Start backend/main.py and verify NEXT_PUBLIC_API_URL (${backendUrl}).`,
+        },
+        { status: 502 },
       );
     }
 
-    const posVotes = localResults.filter((item) => item.label === "positive").length;
-    const total = localResults.length;
-    const consensusLabel: SentimentLabel = posVotes >= Math.ceil(total / 2) ? "positive" : "negative";
-    const avgConfidence = localResults.reduce((sum, item) => sum + item.confidence, 0) / total;
+    if (!response.ok) {
+      const raw = await response.text();
+      const detail = raw.slice(0, 300);
+      return NextResponse.json(
+        {
+          error: "ML backend request failed.",
+          detail: detail || `Status ${response.status}`,
+        },
+        { status: 502 },
+      );
+    }
+
+    const payload = await response.json();
+    const incoming = Array.isArray(payload?.models) ? (payload.models as BackendModel[]) : [];
+    if (incoming.length === 0) {
+      return NextResponse.json(
+        {
+          error: "ML backend returned no model outputs.",
+        },
+        { status: 502 },
+      );
+    }
+
+    const models = incoming.map((item) => buildResult(item));
+    const fallbackConsensus = deriveConsensus(models);
+
+    const backendConsensus = payload?.consensus;
+    const consensus = {
+      label:
+        backendConsensus?.label === "positive" ||
+        backendConsensus?.label === "negative" ||
+        backendConsensus?.label === "indeterminate"
+          ? backendConsensus.label
+          : fallbackConsensus.label,
+      posVotes: Number(backendConsensus?.pos_votes ?? fallbackConsensus.posVotes),
+      total: Number(backendConsensus?.total ?? fallbackConsensus.total),
+      agreement: `${Number(backendConsensus?.pos_votes ?? fallbackConsensus.posVotes)}/${Number(
+        backendConsensus?.total ?? fallbackConsensus.total,
+      )} models positive`,
+      confidence: clamp01(Number(backendConsensus?.confidence ?? fallbackConsensus.confidence)),
+      reason: String(backendConsensus?.reason ?? fallbackConsensus.reason ?? ""),
+    };
 
     return NextResponse.json({
       input: text,
-      models: localResults,
-      consensus: {
-        label: consensusLabel,
-        posVotes,
-        total,
-        agreement: `${posVotes}/${total} models positive`,
-        confidence: clamp01(avgConfidence),
-      },
+      models,
+      consensus,
       meta: {
-        usedTransformer: Boolean(transformer),
         latencyMs: Date.now() - t0,
+        backendLatencyMs: Number(payload?.meta?.latency_ms ?? 0),
+        tokenCount: Number(payload?.meta?.token_count ?? 0),
+        shortTextGuard: Boolean(payload?.meta?.short_text_guard),
+        guardMessage: String(payload?.meta?.guard_message ?? ""),
       },
     });
   } catch (error) {
